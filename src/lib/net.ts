@@ -4,9 +4,36 @@ import sanitizeHtml from "sanitize-html";
 const MAX_REDIRECTS = 5;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_BYTES = 3 * 1024 * 1024; // 3 MB
+export const MAX_SCAN_BYTES = DEFAULT_MAX_BYTES;
 
 const USER_AGENT =
   "Mozilla/5.0 (compatible; jornalReader/1.0; +https://jornal.cc) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/**
+ * Thrown when a response blows the scan cap. The message is user-facing text (it reaches the Add
+ * Block modal verbatim), so it names the cap and the way out; "Response exceeded size limit" told
+ * the reader nothing they could act on. Typed so /api/feed can fall back to a known feed.
+ */
+export class ResponseTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    super(
+      `This page is too large to scan (over ${Math.round(maxBytes / 1024 / 1024)} MB). ` +
+        "Try finding the site's direct RSS link instead.",
+    );
+    this.name = "ResponseTooLargeError";
+  }
+}
+
+// Nothing we did not author belongs in a UI: workerd turns an edge failure into
+// `internal error; reference = ...` and undici throws a bare `fetch failed`. Allow-list would
+// swallow real messages ("Feed not recognized as RSS or Atom"), so deny only the internal shapes.
+const INTERNAL_ERROR = /internal error|reference = |fetch failed|^UND_ERR/i;
+
+/** A message safe to show a reader, or the caller's fallback when the error is internal. */
+export function userFacingError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message.trim() : "";
+  return !message || INTERNAL_ERROR.test(message) ? fallback : message;
+}
 
 type IPv4 = [number, number, number, number];
 
@@ -227,7 +254,7 @@ export async function safeFetchText(
 
       const contentLength = Number(response.headers.get("content-length") ?? "0");
       if (contentLength > maxBytes) {
-        throw new Error("Response exceeds maximum allowed size");
+        throw new ResponseTooLargeError(maxBytes);
       }
 
       const reader = response.body?.getReader();
@@ -247,7 +274,7 @@ export async function safeFetchText(
         totalBytes += value.byteLength;
         if (totalBytes > maxBytes) {
           reader.cancel().catch(() => {});
-          throw new Error("Response exceeded size limit");
+          throw new ResponseTooLargeError(maxBytes);
         }
         chunks.push(value);
       }
@@ -276,6 +303,58 @@ export async function safeFetchText(
   }
 
   throw new Error("Too many redirects");
+}
+
+/** Statuses that mean "TLS broke at the publisher's edge", not "the feed is missing". */
+const TLS_FAILURE_STATUSES = new Set([495, 496, 497, 525, 526]);
+
+function isTlsFailureStatus(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const match = /^Upstream returned HTTP (\d+)$/.exec(error.message);
+  return match ? TLS_FAILURE_STATUSES.has(Number(match[1])) : false;
+}
+
+function looksLikeTlsFailure(error: unknown): boolean {
+  if (isTlsFailureStatus(error)) return true;
+  if (!(error instanceof Error)) return false;
+  // Node surfaces bare `fetch failed`; the cause carries the real reason (handshake, cert, reset).
+  // Workerd surfaces an edge-side 52x as a thrown `internal error; reference = ...` instead of a
+  // response, so that string lands here too. Our own throws ("Request timed out", the SSRF
+  // rejections, "Too many redirects") match none of these, so a real policy failure still fails.
+  const cause = (error as { cause?: unknown }).cause;
+  const detail = `${error.message} ${cause instanceof Error ? cause.message : String(cause ?? "")}`;
+  return /handshake|certificate|ssl|tls|EPROTO|ECONNRESET|fetch failed|internal error/i.test(
+    detail,
+  );
+}
+
+/**
+ * Fetch a FEED url, retrying once over plain http when the https attempt dies at the TLS layer.
+ * CNN is the worked example: `https://rss.cnn.com/...` answers 525 at their edge while
+ * `http://rss.cnn.com/...` serves the same feed.
+ *
+ * ponytail: ceiling — the retry puts the feed URL on the wire in cleartext, so anyone on the path
+ * can read or alter feed items. Accepted because feed bodies are public and the alternative is no
+ * feed at all; it applies to feed fetching only (never /api/article), and the retry is a single
+ * shot at the same host, not a blanket https downgrade. Upgrade path: drop the retry once a
+ * publisher fixes its edge, or proxy the http fetch through a trusted egress.
+ *
+ * The SSRF guard is not bypassed: safeFetchText re-runs assertPublicUrl on every hop, including
+ * the retried http URL, so `https://169.254.169.254/` can never turn into a reachable retry.
+ */
+export async function safeFetchFeedText(
+  rawUrl: string,
+  options?: { accept?: string; timeoutMs?: number; maxBytes?: number },
+): Promise<SafeFetchResult> {
+  try {
+    return await safeFetchText(rawUrl, options);
+  } catch (error) {
+    const url = new URL(rawUrl.trim());
+    if (url.protocol !== "https:" || !looksLikeTlsFailure(error)) throw error;
+
+    url.protocol = "http:";
+    return safeFetchText(url.toString(), options);
+  }
 }
 
 export function resolveSafeUrl(href: string | undefined, baseUrl: string): string | undefined {

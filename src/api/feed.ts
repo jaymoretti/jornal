@@ -2,11 +2,15 @@ import { XMLBuilder, XMLParser } from "fast-xml-parser";
 import { parseHTML } from "linkedom";
 import {
   decodeHtmlEntities,
+  MAX_SCAN_BYTES,
+  ResponseTooLargeError,
   resolveSafeUrl,
-  safeFetchText,
+  type SafeFetchResult,
+  safeFetchFeedText,
   sanitizeArticleHtml,
   stripHtmlToText,
-} from "../lib/net";
+  userFacingError,
+} from "../lib/net.ts";
 import type { FeedItem, FeedResponse } from "../lib/types";
 
 type XmlNode = Record<string, unknown>;
@@ -218,6 +222,26 @@ function normalizeInputUrl(raw: string): string {
   return `https://${trimmed}`;
 }
 
+/** Robots.txt is small; a bigger one is not ours to read. */
+const ROBOTS_MAX_BYTES = 256 * 1024;
+
+/**
+ * Sitemaps worth trying, in preference order. Bounded so one Add Block attempt makes a predictable
+ * number of outbound requests: 1 robots + (2 sitemaps + their index child) + 7 path probes.
+ */
+const MAX_SITEMAP_TRIES = 2;
+
+/** Feed paths nearly every CMS exposes, cheapest generic fallback when a site hides its tags. */
+const COMMON_FEED_PATHS = [
+  "/feed",
+  "/feed.xml",
+  "/rss",
+  "/rss.xml",
+  "/atom.xml",
+  "/index.xml",
+  "/feeds/all.rss",
+];
+
 function discoverFeedUrl(html: string, baseUrl: string): string | null {
   try {
     const { document } = parseHTML(html);
@@ -333,24 +357,119 @@ function dateFromPath(pathname: string): string | undefined {
   return new Date(Date.UTC(year, month - 1, day)).toISOString();
 }
 
+/**
+ * Readable headline from a URL slug, shared by the anchor scrape and sitemap discovery: strip the
+ * extension, a trailing date (`-2026-11-22`) or numeric id, then hyphenate into words. Short
+ * results are rejected — "news" is a section, not a story.
+ */
+function titleFromSlug(slug: string): string {
+  const words = slug
+    .replace(/\.[a-z]{2,6}$/i, "")
+    .replace(/[-_]\d{4}([-_]\d{1,2}){0,2}$/, "")
+    .replace(/[-_]\d{4,}$/, "")
+    .replace(/[-_]+/g, " ")
+    .trim();
+  if (words.length < MIN_HEADLINE_CHARS) return "";
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 function anchorTitle(anchor: Element, slug: string): string {
   const fromText = cleanText(anchor.innerHTML);
   if (fromText.length >= MIN_HEADLINE_CHARS) return fromText;
   const fromAttr = cleanText(anchor.getAttribute("title"));
   if (fromAttr.length >= MIN_HEADLINE_CHARS) return fromAttr;
-  const words = slug.replace(/[-_]+/g, " ").trim();
-  if (words.length < MIN_HEADLINE_CHARS) return "";
-  return words.charAt(0).toUpperCase() + words.slice(1);
+  return titleFromSlug(slug);
 }
 
-function anchorImage(anchor: Element, baseUrl: string): string | undefined {
-  // Cards rarely wrap the whole teaser in the anchor, so walk a few ancestors for the thumbnail.
-  let node: Element | null = anchor;
-  for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
-    const img = node.querySelector("img");
-    const src = img?.getAttribute("src") ?? img?.getAttribute("data-src");
-    const resolved = resolveSafeUrl(src ?? undefined, baseUrl);
+/** Absolute URL of a story-shaped link on the page's own site, or null when it is chrome/nav. */
+function storyUrl(anchor: Element, pageUrl: string, pageHost: string, pageKey: string): URL | null {
+  const resolved = resolveSafeUrl(anchor.getAttribute("href") ?? undefined, pageUrl);
+  if (!resolved) return null;
+
+  const url = new URL(resolved);
+  const host = url.hostname.replace(/^www\./, "");
+  // Hash-only and query-only links resolve to the page itself and die here too.
+  if (host !== pageHost && !host.endsWith(`.${pageHost}`)) return null;
+  if (urlKey(resolved) === pageKey) return null;
+
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (segments.length < 2) return null;
+  if (segments.some((segment) => NON_ARTICLE_SEGMENTS.has(segment.toLowerCase()))) return null;
+  return url;
+}
+
+/** Ancestor → the story URLs it wraps. A single key means that subtree belongs to one story. */
+type StoryUnits = Map<Element, Set<string>>;
+
+/** Levels searched for a story's card: the anchor plus five ancestors. */
+const UNIT_DEPTH = 6;
+
+/** Chrome, not a story photo: BBC ships a grey placeholder <img> ahead of the real one. */
+const DECORATIVE_IMAGE = /placeholder|spacer|\bpixel\b|[/_-]1x1(?:[./_-]|$)|\.svg(?:[?#]|$)/i;
+
+function imageIn(node: Element, baseUrl: string): string | undefined {
+  for (const img of Array.from(node.querySelectorAll("img"))) {
+    const src = img.getAttribute("src") ?? img.getAttribute("data-src");
+    if (!src || DECORATIVE_IMAGE.test(src)) continue;
+    const resolved = resolveSafeUrl(src, baseUrl);
     if (resolved) return resolved;
+  }
+  return undefined;
+}
+
+/**
+ * Map every story anchor's ancestors to the story keys they contain.
+ *
+ * A homepage grid cell usually wraps several stories, so the same ancestor is reached by each of
+ * their anchors and its set holds several keys — that is exactly what tells a shared container
+ * apart from a card that belongs to one story.
+ */
+function storyUnits(
+  document: Document,
+  pageUrl: string,
+  pageHost: string,
+  pageKey: string,
+): StoryUnits {
+  const units: StoryUnits = new Map();
+  for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
+    const url = storyUrl(anchor, pageUrl, pageHost, pageKey);
+    if (!url) continue;
+    const key = urlKey(url.toString());
+    let node: Element | null = anchor;
+    for (let depth = 0; node && depth < UNIT_DEPTH; depth++, node = node.parentElement) {
+      const keys = units.get(node) ?? new Set<string>();
+      keys.add(key);
+      units.set(node, keys);
+    }
+  }
+  return units;
+}
+
+/**
+ * The story's own thumbnail, or nothing.
+ *
+ * Climb from the anchor while every ancestor still wraps only this story; the deepest such
+ * ancestor is the card, and an <img> inside it is this story's photo. The moment an ancestor wraps
+ * a second story, any image below it may belong to that other story, so the answer is "no image"
+ * — a missing photo renders a clean card, a borrowed one tells a lie.
+ *
+ * ponytail: ceiling — grouping is inferred from link shape, so a layout that puts the photo in a
+ * sibling of the card root, or in a script payload, still yields no image. Upgrade path:
+ * per-publisher selectors keyed off the hostname, or an og:image probe per article URL.
+ */
+function anchorImage(
+  anchor: Element,
+  baseUrl: string,
+  key: string,
+  units: StoryUnits,
+): string | undefined {
+  let node: Element | null = anchor;
+  for (let depth = 0; node && depth < UNIT_DEPTH; depth++, node = node.parentElement) {
+    const keys = units.get(node);
+    // Not a story anchor we counted, or a subtree that also holds another story: stop climbing.
+    if (!keys?.has(key) || keys.size > 1) return undefined;
+    const image = imageIn(node, baseUrl);
+    if (image) return image;
   }
   return undefined;
 }
@@ -364,7 +483,7 @@ function anchorImage(anchor: Element, baseUrl: string): string | undefined {
  * article on click. Upgrade path: per-publisher selectors keyed off the hostname, or an
  * og:image/Readability probe per candidate link.
  */
-function buildSyntheticFeed(html: string, pageUrl: string): FeedResponse | null {
+export function buildSyntheticFeed(html: string, pageUrl: string): FeedResponse | null {
   let document: Document;
   try {
     ({ document } = parseHTML(html));
@@ -384,22 +503,16 @@ function buildSyntheticFeed(html: string, pageUrl: string): FeedResponse | null 
 
   const items: Array<{ score: number; rank: number; item: FeedItem }> = [];
   const seen = new Set<string>();
+  const units = storyUnits(document, pageUrl, pageHost, pageKey);
 
   for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
-    const resolved = resolveSafeUrl(anchor.getAttribute("href") ?? undefined, pageUrl);
-    if (!resolved) continue;
-
-    const url = new URL(resolved);
-    const host = url.hostname.replace(/^www\./, "");
-    // Hash-only and query-only links resolve to the page itself and die here too.
-    if (host !== pageHost && !host.endsWith(`.${pageHost}`)) continue;
+    const url = storyUrl(anchor, pageUrl, pageHost, pageKey);
+    if (!url) continue;
+    const resolved = url.toString();
     const key = urlKey(resolved);
-    if (key === pageKey || seen.has(key)) continue;
+    if (seen.has(key)) continue;
 
     const segments = url.pathname.split("/").filter(Boolean);
-    if (segments.length < 2) continue;
-    if (segments.some((segment) => NON_ARTICLE_SEGMENTS.has(segment.toLowerCase()))) continue;
-
     const slug = segments[segments.length - 1].replace(/\.[a-z]{2,6}$/i, "");
     const isoDate = dateFromPath(url.pathname);
     const title = anchorTitle(anchor, slug);
@@ -432,7 +545,7 @@ function buildSyntheticFeed(html: string, pageUrl: string): FeedResponse | null 
         title,
         link: resolved,
         isoDate,
-        image: anchorImage(anchor, pageUrl),
+        image: anchorImage(anchor, pageUrl, key, units),
         feedTitle: pageTitle || undefined,
         feedUrl: pageUrl,
       },
@@ -441,20 +554,186 @@ function buildSyntheticFeed(html: string, pageUrl: string): FeedResponse | null 
 
   if (!items.length) return null;
 
+  // Ranking decides who makes the cut; the image is then claimed once, so one picture cannot show
+  // up under two different headlines. First item in feed order wins.
+  const claimed = new Set<string>();
+  const feed = items
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 40)
+    .sort((a, b) => a.rank - b.rank)
+    .map(({ item }) => {
+      if (!item.image) return item;
+      if (claimed.has(item.image)) return { ...item, image: undefined };
+      claimed.add(item.image);
+      return item;
+    });
+
+  return feedPayload(pageTitle || pageHost, pageUrl, feed);
+}
+
+/** The FeedResponse envelope every discovery step returns, so the UI sees one shape. */
+function feedPayload(title: string, siteUrl: string, items: FeedItem[]): FeedResponse {
   return {
-    title: pageTitle || pageHost,
-    link: pageUrl,
-    favicon: `https://icons.duckduckgo.com/ip3/${encodeURIComponent(new URL(pageUrl).hostname)}.ico`,
-    feedUrl: pageUrl,
+    title,
+    link: siteUrl,
+    favicon: `https://icons.duckduckgo.com/ip3/${encodeURIComponent(new URL(siteUrl).hostname)}.ico`,
+    feedUrl: siteUrl,
     fetchedAt: new Date().toISOString(),
-    // Keep the 40 highest scores, then restore page order (newest first): ranking is only there
-    // to pick the survivors, and document order is the better reading order.
-    items: items
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 40)
-      .sort((a, b) => a.rank - b.rank)
-      .map(({ item }) => item),
+    items: items.slice(0, 40),
   };
+}
+
+interface SitemapEntry {
+  loc: string;
+  lastmod?: string;
+  /** Google News sitemaps carry the real headline; sitemaps.org ones do not. */
+  title?: string;
+}
+
+/** `<url>` entries from a `<urlset>`, or child sitemap URLs from a `<sitemapindex>`. */
+function parseSitemap(xml: string, baseUrl: string): { urls: SitemapEntry[]; children: string[] } {
+  const doc = parser.parse(xml) as XmlNode;
+  const children = asArray(child(child(doc, "sitemapindex"), "sitemap"))
+    .map((entry) => resolveSafeUrl(nodeText(child(entry, "loc")), baseUrl))
+    .filter((url): url is string => Boolean(url));
+  const urls: SitemapEntry[] = [];
+  for (const entry of asArray(child(child(doc, "urlset"), "url"))) {
+    const loc = resolveSafeUrl(nodeText(child(entry, "loc")), baseUrl);
+    if (loc) {
+      urls.push({
+        loc,
+        lastmod: isoOrUndefined(nodeText(child(entry, "lastmod"))),
+        title: cleanText(nodeText(child(child(entry, "news:news"), "news:title"))) || undefined,
+      });
+    }
+  }
+  return { urls, children };
+}
+
+/** `/news/` sitemaps carry stories, `/article/` next, the rest last. Stable within each rank. */
+function rankSitemaps(urls: string[]): string[] {
+  const rank = (url: string) => (/news/i.test(url) ? 0 : /article/i.test(url) ? 1 : 2);
+  return [...urls].sort((a, b) => rank(a) - rank(b));
+}
+
+/** Fetch XML for a discovery step, or null when this step fails (404, TLS, past the size cap). */
+async function fetchXmlOrNull(url: string, maxBytes?: number): Promise<string | null> {
+  try {
+    const fetched = await safeFetchFeedText(url, {
+      accept: "application/xml, text/xml, text/plain, */*;q=0.8",
+      maxBytes,
+    });
+    return fetched.text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Step D: robots.txt → sitemap → article URLs. This is what rescues CNN, whose homepage is 6.9 MB
+ * of JavaScript with no feed tag and no usable anchors, but whose robots.txt declares
+ * /sitemap/news.xml with 111 dated article URLs and real `<news:title>` headlines.
+ *
+ * ponytail: ceiling — when a sitemap is a plain sitemaps.org one, titles fall back to the URL slug
+ * ("house-races-midterms-votes-vis") because fetching 40 pages to learn their headlines costs 40
+ * requests and seconds. Slugs are decent for news and poor for opaque ids; no summary, body or
+ * image either, so the reader fetches the article on click. Upgrade path: an og:title probe per
+ * item, batched with a concurrency limit.
+ *
+ * Every URL here (robots, sitemap, child sitemap, each loc) is fetched through safeFetchFeedText,
+ * so a sitemap full of private addresses is rejected by the same guard as user input.
+ */
+async function discoverFromSitemaps(siteUrl: string): Promise<FeedResponse | null> {
+  const site = new URL(siteUrl);
+  const robots = await fetchXmlOrNull(new URL("/robots.txt", site).toString(), ROBOTS_MAX_BYTES);
+  if (!robots) return null;
+
+  const declared = [...robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)].map((match) => match[1].trim());
+  for (const candidate of rankSitemaps(declared).slice(0, MAX_SITEMAP_TRIES)) {
+    const xml = await fetchXmlOrNull(candidate);
+    if (!xml) continue;
+
+    let { urls: entries, children } = parseSitemap(xml, candidate);
+    if (!entries.length && children.length) {
+      // One level only: a sitemapindex of sitemapindexes is not worth walking for a feed.
+      const childUrl = rankSitemaps(children)[0];
+      const childXml = await fetchXmlOrNull(childUrl);
+      if (!childXml) continue;
+      entries = parseSitemap(childXml, childUrl).urls;
+    }
+
+    const feed = feedFromSitemapEntries(entries, site);
+    if (feed) return feed;
+  }
+  return null;
+}
+
+/** Article-shaped `<loc>`s → items, newest first when the sitemap dates them. */
+function feedFromSitemapEntries(entries: SitemapEntry[], site: URL): FeedResponse | null {
+  const siteHost = site.hostname.replace(/^www\./, "");
+  const seen = new Set<string>();
+  const items: FeedItem[] = [];
+
+  for (const { loc, lastmod, title: newsTitle } of entries) {
+    let url: URL;
+    try {
+      url = new URL(loc);
+    } catch {
+      continue;
+    }
+    const host = url.hostname.replace(/^www\./, "");
+    if (host !== siteHost && !host.endsWith(`.${siteHost}`)) continue;
+
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length < 2) continue;
+    if (segments.some((segment) => NON_ARTICLE_SEGMENTS.has(segment.toLowerCase()))) continue;
+
+    // Prefer the sitemap's own headline when it ships one; a slug is the fallback, not the goal.
+    const title = newsTitle || titleFromSlug(segments[segments.length - 1]);
+    if (!title) continue;
+    const key = urlKey(loc);
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    items.push({
+      id: loc,
+      title,
+      link: loc,
+      isoDate: lastmod ?? dateFromPath(url.pathname),
+      feedTitle: site.hostname,
+      feedUrl: site.toString(),
+    });
+  }
+
+  if (!items.length) return null;
+  items.sort((a, b) => (b.isoDate ?? "").localeCompare(a.isoDate ?? ""));
+  return feedPayload(site.hostname, site.toString(), items);
+}
+
+/** Step E: probe the handful of feed paths almost every CMS answers. */
+async function probeCommonFeedPaths(siteUrl: string): Promise<FeedResponse | null> {
+  const origin = new URL(siteUrl).origin;
+  for (const path of COMMON_FEED_PATHS) {
+    let fetched: SafeFetchResult;
+    try {
+      fetched = await safeFetchFeedText(new URL(path, origin).toString(), { accept: FEED_ACCEPT });
+    } catch {
+      continue;
+    }
+    // A 200 HTML "not found" page is the common failure here; only a real feed counts.
+    if (looksLikeHtml(fetched.text, fetched.contentType)) continue;
+    try {
+      return feedResponseFrom(fetched);
+    } catch {
+      // Not a feed after all; try the next path.
+    }
+  }
+  return null;
+}
+
+/** Generic last resort for a page that gave us nothing: sitemaps first, then path probes. */
+async function discoverSiteFeed(siteUrl: string): Promise<FeedResponse | null> {
+  return (await discoverFromSitemaps(siteUrl)) ?? (await probeCommonFeedPaths(siteUrl));
 }
 
 function json(body: unknown, status = 200): Response {
@@ -464,6 +743,74 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+const FEED_ACCEPT =
+  "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8";
+
+/**
+ * Fetch exactly what the reader pasted. Deliberately no hostname→feed table: such a table only
+ * helps readers who already know the site is special, needs manual maintenance, and rots as
+ * publishers move their feeds. The generic chain in handleFeed treats every site the same way.
+ * safeFetchFeedText adds the single https→http retry for TLS failures at the publisher's edge.
+ */
+function fetchFeedSource(normalizedUrl: string): Promise<SafeFetchResult> {
+  return safeFetchFeedText(normalizedUrl, { accept: FEED_ACCEPT });
+}
+
+/** XML feed text → the FeedResponse the UI consumes. Throws when the document is not a feed. */
+function feedResponseFrom(fetched: SafeFetchResult): FeedResponse {
+  const parsed = parseFeed(fetched.text, fetched.finalUrl);
+  const siteLink = resolveSafeUrl(parsed.link, fetched.finalUrl) ?? fetched.finalUrl;
+  let favicon: string | undefined;
+  try {
+    const host = new URL(siteLink).hostname;
+    favicon = `https://icons.duckduckgo.com/ip3/${encodeURIComponent(host)}.ico`;
+  } catch {
+    favicon = undefined;
+  }
+
+  const items: FeedItem[] = parsed.items.slice(0, 40).map((item, idx) => {
+    const itemLink = resolveSafeUrl(item.link, siteLink) ?? siteLink;
+    const rawHtml = item.bodyHtml ?? "";
+    // Was stripHtmlToText(contentSnippet || summary || rawHtml, 220). contentSnippet was the
+    // already-stripped <content>/<description>, so the same source text lands here.
+    const summarySource = item.summaryHtml ?? rawHtml;
+    const summary = summarySource ? stripHtmlToText(summarySource, 220) : undefined;
+    const contentHtml = rawHtml ? sanitizeArticleHtml(rawHtml, itemLink) : undefined;
+
+    return {
+      id: item.id || itemLink || `${fetched.finalUrl}#${idx}`,
+      title: decodeHtmlEntities((item.title || "Untitled").trim()),
+      link: itemLink,
+      isoDate: item.isoDate,
+      author: decodeHtmlEntities((item.author || "").trim()) || undefined,
+      summary: summary ? decodeHtmlEntities(summary) : undefined,
+      contentHtml,
+      image: extractImageFromItem(item, itemLink),
+      feedTitle: decodeHtmlEntities((parsed.title || "").trim()) || undefined,
+      feedUrl: fetched.finalUrl,
+    };
+  });
+
+  return {
+    title: decodeHtmlEntities((parsed.title || new URL(fetched.finalUrl).hostname).trim()),
+    description: parsed.description ? decodeHtmlEntities(parsed.description.trim()) : undefined,
+    link: siteLink,
+    favicon,
+    feedUrl: fetched.finalUrl,
+    fetchedAt: new Date().toISOString(),
+    items,
+  };
+}
+
+/**
+ * Discovery chain, first success wins:
+ *   A. the URL is already a feed → parse it
+ *   B. `<link rel="alternate">` on the page
+ *   C. article links in the page itself (synthetic feed)
+ *   D. robots.txt → sitemap → `<loc>` URLs (synthetic feed)
+ *   E. probe /feed, /rss.xml, … on the origin, first that parses wins
+ * and then an honest 422. Only step A short-circuits; B–E all end in the same cache + return.
+ */
 export async function handleFeed(request: Request): Promise<Response> {
   const params = new URL(request.url).searchParams;
   const rawUrl = params.get("url") ?? "";
@@ -482,87 +829,66 @@ export async function handleFeed(request: Request): Promise<Response> {
   }
 
   try {
-    let fetched = await safeFetchText(normalizedUrl, {
-      accept:
-        "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8",
-    });
-
-    // If user pasted a website URL instead of the feed URL, auto-discover the RSS/Atom link
-    if (looksLikeHtml(fetched.text, fetched.contentType)) {
-      const discovered = discoverFeedUrl(fetched.text, fetched.finalUrl);
-      if (!discovered) {
-        const synthetic = buildSyntheticFeed(fetched.text, fetched.finalUrl);
-        if (!synthetic) {
-          return json(
-            {
-              error:
-                "No RSS or Atom feed found, and no article links could be extracted from this page.",
-            },
-            422,
-          );
-        }
-        cacheSet(normalizedUrl, synthetic);
-        if (fetched.finalUrl !== normalizedUrl) {
-          cacheSet(fetched.finalUrl, synthetic);
-        }
-        return json(synthetic);
-      }
-      fetched = await safeFetchText(discovered, {
-        accept: "application/rss+xml, application/atom+xml, application/xml, text/xml",
-      });
-    }
-
-    const parsed = parseFeed(fetched.text, fetched.finalUrl);
-    const siteLink = resolveSafeUrl(parsed.link, fetched.finalUrl) ?? fetched.finalUrl;
-    let favicon: string | undefined;
+    let fetched: SafeFetchResult | null = null;
     try {
-      const host = new URL(siteLink).hostname;
-      favicon = `https://icons.duckduckgo.com/ip3/${encodeURIComponent(host)}.ico`;
-    } catch {
-      favicon = undefined;
+      fetched = await fetchFeedSource(normalizedUrl);
+    } catch (error) {
+      // A page past the scan cap still has a robots.txt and a sitemap, so the page-shaped steps
+      // (A/B/C) are skipped but discovery continues. Only the size cap is survivable here;
+      // anything else (SSRF rejection, timeout, 404) is a real answer for the reader.
+      if (!(error instanceof ResponseTooLargeError)) throw error;
     }
 
-    const items: FeedItem[] = parsed.items.slice(0, 40).map((item, idx) => {
-      const itemLink = resolveSafeUrl(item.link, siteLink) ?? siteLink;
-      const rawHtml = item.bodyHtml ?? "";
-      // Was stripHtmlToText(contentSnippet || summary || rawHtml, 220). contentSnippet was the
-      // already-stripped <content>/<description>, so the same source text lands here.
-      const summarySource = item.summaryHtml ?? rawHtml;
-      const summary = summarySource ? stripHtmlToText(summarySource, 220) : undefined;
-      const contentHtml = rawHtml ? sanitizeArticleHtml(rawHtml, itemLink) : undefined;
+    if (fetched) {
+      // A. The reader pasted a feed, not a homepage.
+      if (!looksLikeHtml(fetched.text, fetched.contentType)) {
+        return respond(normalizedUrl, fetched.finalUrl, feedResponseFrom(fetched));
+      }
 
-      return {
-        id: item.id || itemLink || `${fetched.finalUrl}#${idx}`,
-        title: decodeHtmlEntities((item.title || "Untitled").trim()),
-        link: itemLink,
-        isoDate: item.isoDate,
-        author: decodeHtmlEntities((item.author || "").trim()) || undefined,
-        summary: summary ? decodeHtmlEntities(summary) : undefined,
-        contentHtml,
-        image: extractImageFromItem(item, itemLink),
-        feedTitle: decodeHtmlEntities((parsed.title || "").trim()) || undefined,
-        feedUrl: fetched.finalUrl,
-      };
-    });
+      // B. The publisher advertises its feed.
+      const discovered = discoverFeedUrl(fetched.text, fetched.finalUrl);
+      if (discovered) {
+        const feedXml = await safeFetchFeedText(discovered, {
+          accept: "application/rss+xml, application/atom+xml, application/xml, text/xml",
+        });
+        try {
+          return respond(normalizedUrl, fetched.finalUrl, feedResponseFrom(feedXml));
+        } catch {
+          // An advertised tag pointing at HTML happens; keep walking the chain.
+        }
+      }
 
-    const payload: FeedResponse = {
-      title: decodeHtmlEntities((parsed.title || new URL(fetched.finalUrl).hostname).trim()),
-      description: parsed.description ? decodeHtmlEntities(parsed.description.trim()) : undefined,
-      link: siteLink,
-      favicon,
-      feedUrl: fetched.finalUrl,
-      fetchedAt: new Date().toISOString(),
-      items,
-    };
-
-    cacheSet(normalizedUrl, payload);
-    if (fetched.finalUrl !== normalizedUrl) {
-      cacheSet(fetched.finalUrl, payload);
+      // C. Article links are in the HTML we already paid for.
+      const synthetic = buildSyntheticFeed(fetched.text, fetched.finalUrl);
+      if (synthetic) return respond(normalizedUrl, fetched.finalUrl, synthetic);
     }
 
-    return json(payload);
+    // D + E. Generic discovery: sitemaps, then the usual feed paths on the origin.
+    const siteFeed = await discoverSiteFeed(fetched?.finalUrl ?? normalizedUrl);
+    if (siteFeed) return respond(normalizedUrl, siteFeed.feedUrl, siteFeed);
+
+    // Nothing worked. Keep the size-cap wording when that is why the page steps were skipped:
+    // "too large to scan, try the direct RSS link" is more useful than "no feed found".
+    if (!fetched) throw new ResponseTooLargeError(MAX_SCAN_BYTES);
+
+    return json(
+      {
+        error:
+          "No RSS or Atom feed found for this site. Try the publisher's direct feed link if you know it.",
+      },
+      422,
+    );
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to load feed";
+    const message = userFacingError(error, "Could not load this feed. Try its direct RSS link.");
     return json({ error: message }, 400);
   }
+}
+
+/** Cache under both the key the reader typed and the URL we ended up at, then serialise. */
+function respond(typedUrl: string, finalUrl: string, payload: FeedResponse): Response {
+  cacheSet(typedUrl, payload);
+  if (finalUrl !== typedUrl) {
+    cacheSet(finalUrl, payload);
+  }
+  return json(payload);
 }

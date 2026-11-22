@@ -6,6 +6,7 @@ import {
   safeFetchText,
   sanitizeArticleHtml,
   stripHtmlToText,
+  userFacingError,
 } from "../lib/net";
 import type { ArticleResponse } from "../lib/types";
 
@@ -124,7 +125,7 @@ export async function handleArticle(request: Request): Promise<Response> {
     cacheSet(rawUrl, payload);
     return json(payload);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to extract article";
+    const message = userFacingError(error, "Could not load this article.");
     return json({ error: message }, 400);
   }
 }
