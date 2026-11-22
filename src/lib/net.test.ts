@@ -6,7 +6,10 @@ import {
   dedupeArticleImages,
   imageKey,
   isPrivateIp,
+  ResponseTooLargeError,
+  safeFetchFeedText,
   sanitizeArticleHtml,
+  userFacingError,
 } from "./net.ts";
 
 test("decodes HTML entities left in CDATA titles", () => {
@@ -122,4 +125,43 @@ test("collapses a body image that repeats further down the article", () => {
   `;
   const { contentHtml } = dedupeArticleImages(body, undefined, "https://example.com/story");
   assert.equal((contentHtml.match(/chart\.png/g) ?? []).length, 1, "duplicate body image dropped");
+});
+
+test("size cap reports an actionable message, not an internal string", () => {
+  const err = new ResponseTooLargeError(3 * 1024 * 1024);
+  assert.equal(
+    err.message,
+    "This page is too large to scan (over 3 MB). Try finding the site's direct RSS link instead.",
+  );
+  assert.equal(userFacingError(err, "fallback"), err.message);
+});
+
+test("internal runtime strings never reach a reader", () => {
+  const fallback = "Could not load this feed. Try its direct RSS link.";
+  assert.equal(
+    userFacingError(new Error("internal error; reference = abc123"), fallback),
+    fallback,
+  );
+  assert.equal(userFacingError(new TypeError("fetch failed"), fallback), fallback);
+  assert.equal(userFacingError("not an error", fallback), fallback);
+  assert.equal(userFacingError(new Error(""), fallback), fallback);
+  // A message we wrote for readers survives.
+  assert.equal(
+    userFacingError(new Error("Upstream returned HTTP 404"), fallback),
+    "Upstream returned HTTP 404",
+  );
+});
+
+// The retry swaps https for http, so it must never widen SSRF reach: the guard has to reject the
+// scheme-swapped URL before any socket opens, even when the original https URL was also blocked.
+test("http retry cannot reach a private address", async () => {
+  for (const url of [
+    "https://169.254.169.254/",
+    "https://localhost:3000/",
+    "https://127.1/",
+    "https://2130706433/",
+    "https://[::1]/",
+  ]) {
+    await assert.rejects(() => safeFetchFeedText(url, { timeoutMs: 1000 }), /not allowed/);
+  }
 });
