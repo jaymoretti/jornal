@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jornal",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-08-04",
+  // nodejs_compat: sanitize-html/readability pull Node built-ins.
+  // global_fetch_strictly_public: our fetches are outbound-only; a request to our own zone must
+  // loop back through Cloudflare's front door instead of reaching a private origin.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    // `npm run build` writes the SPA here; the Worker only owns /api/*.
+    "directory": "dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // /api/* must reach the Worker instead of being answered by the asset layer or the SPA fallback.
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}

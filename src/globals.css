@@ -1,0 +1,324 @@
+@import "tailwindcss";
+
+/* Self-hosted @fontsource families. These CSS variables keep the same four names the components
+   and @theme inline below already reference, so no component needed a font change. */
+:root {
+  --font-display: "Archivo Black";
+  --font-geist-sans: "Geist Variable";
+  --font-geist-mono: "Geist Mono Variable";
+  --font-newsreader: "Newsreader Variable";
+}
+
+:root,
+[data-theme="dark"] {
+  --bg: #000000;
+  --surface: #111113;
+  --surface-subtle: #18181c;
+  --surface-hover: #1d1d22;
+  --surface-elevated: #141417;
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --fg: #ffffff;
+  --fg-secondary: #b4b4be;
+  --fg-muted: #6f6f7a;
+  --cobalt: #2446e3;
+  --cobalt-hover: #2f54f5;
+  --btn-bg: #2446e3;
+  --btn-fg: #ffffff;
+  --btn-hover: #2f54f5;
+  --popover-shadow: 0 20px 60px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg: #ecece7;
+  --surface: #ffffff;
+  --surface-subtle: #f3f3ee;
+  --surface-hover: #ededdf;
+  --surface-elevated: #ffffff;
+  --border: rgba(15, 15, 16, 0.1);
+  --border-strong: rgba(15, 15, 16, 0.22);
+  --border-subtle: rgba(15, 15, 16, 0.06);
+  --fg: #0d0d0f;
+  --fg-secondary: #43434a;
+  --fg-muted: #787882;
+  --cobalt: #2446e3;
+  --cobalt-hover: #1c3ad1;
+  --btn-bg: #2446e3;
+  --btn-fg: #ffffff;
+  --btn-hover: #1c3ad1;
+  --popover-shadow: 0 20px 60px rgba(0, 0, 0, 0.14), 0 0 0 1px rgba(0, 0, 0, 0.08);
+  color-scheme: light;
+}
+
+[data-theme="sepia"] {
+  --bg: #e9e2d2;
+  --surface: #f7f3ea;
+  --surface-subtle: #ede6d7;
+  --surface-hover: #e6decd;
+  --surface-elevated: #faf6ee;
+  --border: rgba(38, 30, 22, 0.11);
+  --border-strong: rgba(38, 30, 22, 0.24);
+  --border-subtle: rgba(38, 30, 22, 0.07);
+  --fg: #1d1711;
+  --fg-secondary: #4f4337;
+  --fg-muted: #847565;
+  --cobalt: #2446e3;
+  --cobalt-hover: #1c3ad1;
+  --btn-bg: #1d1711;
+  --btn-fg: #f7f3ea;
+  --btn-hover: #33291f;
+  --popover-shadow: 0 20px 60px rgba(38, 30, 22, 0.16), 0 0 0 1px rgba(38, 30, 22, 0.1);
+  color-scheme: light;
+}
+
+@theme inline {
+  --font-display: var(--font-display), var(--font-geist-sans), ui-sans-serif, sans-serif;
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-serif: var(--font-newsreader), Georgia, Cambria, serif;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Bento CSS Grid with responsive desktop spans and clean mobile stack */
+.bento-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+}
+
+@media (min-width: 768px) and (max-width: 1023px) {
+  .bento-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-flow: dense;
+  }
+  .bento-item {
+    grid-column: span min(var(--col-span, 1), 2);
+  }
+}
+
+@media (min-width: 1024px) {
+  .bento-grid {
+    grid-template-columns: repeat(var(--grid-cols, 3), minmax(0, 1fr));
+    grid-auto-rows: var(--grid-row-px, 280px);
+    grid-auto-flow: dense;
+  }
+  .bento-item {
+    grid-column: span var(--col-span, 1);
+    grid-row: span var(--row-span, 1);
+    height: 100%;
+  }
+  .bento-item[data-collapsed="true"] {
+    grid-row: span 1;
+    height: auto;
+    align-self: start;
+  }
+}
+
+/* Architectural subtle dot grid shown in Grid Editor mode */
+.bento-edit-canvas {
+  background-image: radial-gradient(
+    color-mix(in srgb, var(--fg) 18%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 24px 24px;
+}
+
+/* Ad-free Reader typography */
+.reader-prose {
+  color: var(--fg-secondary);
+  line-height: 1.72;
+  overflow-wrap: anywhere;
+}
+
+/* Editorial rhythm: paragraphs get real breathing room instead of a blanket 1.2em */
+.reader-prose p {
+  color: var(--fg-secondary);
+  margin: 0 0 1.4em;
+}
+
+.reader-prose > p:last-child {
+  margin-bottom: 0;
+}
+
+/* Fallback spacing for any element that isn't a paragraph (kept tight so it doesn't
+   double up with the paragraph margin above) */
+.reader-prose > * + * {
+  margin-top: 1.35em;
+}
+
+.reader-prose > p + p {
+  margin-top: 0;
+}
+
+.reader-prose h1,
+.reader-prose h2,
+.reader-prose h3,
+.reader-prose h4 {
+  color: var(--fg);
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  margin-top: 2.1em;
+  margin-bottom: 0.7em;
+}
+
+.reader-prose h1 {
+  font-size: 1.45em;
+}
+.reader-prose h2 {
+  font-size: 1.22em;
+}
+.reader-prose h3 {
+  font-size: 1.05em;
+}
+
+.reader-prose h1 + p,
+.reader-prose h2 + p,
+.reader-prose h3 + p,
+.reader-prose h4 + p {
+  margin-top: 0;
+}
+
+.reader-prose strong,
+.reader-prose b {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.reader-prose a {
+  color: var(--fg);
+  text-decoration: underline;
+  text-decoration-color: var(--cobalt);
+  text-underline-offset: 4px;
+  text-decoration-thickness: 1.5px;
+  transition: opacity 150ms ease;
+}
+
+.reader-prose a:hover {
+  opacity: 0.8;
+}
+
+.reader-prose ul,
+.reader-prose ol {
+  padding-left: 1.4em;
+}
+
+.reader-prose ul {
+  list-style: disc;
+}
+.reader-prose ol {
+  list-style: decimal;
+}
+.reader-prose li + li {
+  margin-top: 0.45em;
+}
+
+.reader-prose blockquote {
+  border-left: 3px solid var(--cobalt);
+  padding-left: 1.2em;
+  color: var(--fg);
+}
+
+.reader-prose pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.875rem;
+  padding: 1rem 1.2rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  line-height: 1.6;
+  color: var(--fg);
+}
+
+.reader-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--surface-subtle);
+  padding: 0.14em 0.38em;
+  border-radius: 0.35rem;
+  color: var(--fg);
+}
+
+.reader-prose pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.reader-prose img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 1rem;
+  margin: 1.9em auto;
+  display: block;
+}
+
+.reader-prose figure {
+  margin: 1.9em 0;
+}
+
+/* Images already carry their own vertical margin; don't stack paragraph spacing on top */
+.reader-prose img + *,
+.reader-prose figure + * {
+  margin-top: 0;
+}
+
+.reader-prose p + img,
+.reader-prose p + figure {
+  margin-top: 1.9em;
+}
+
+.reader-prose figcaption {
+  font-family: var(--font-mono);
+  font-size: 0.72em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-muted);
+  text-align: center;
+  margin-top: 0.8em;
+}
+
+.reader-prose hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2.4em 0;
+}
+
+.reader-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-sans);
+  font-size: 0.86em;
+  display: block;
+  overflow-x: auto;
+}
+
+.reader-prose th,
+.reader-prose td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+}
+
+.reader-prose th {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
